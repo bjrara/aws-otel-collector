@@ -35,383 +35,6 @@ env:
   WIN_SIGNED_PKG_FOLDER: OTelCollectorAuthenticode/AuthenticodeSigner-SHA256-RSA
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-    # Set up building environment, patch the dev repo code on dispatch events.
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v2
-      with:
-        go-version: ^1.13
-
-    - uses: actions/checkout@v2
-
-    - name: Checkout dev opentelemetry-collector-contrib
-      if: github.event_name == 'repository_dispatch'
-      uses: actions/checkout@v2
-      with:
-        repository: ${{ github.repository_owner }}/opentelemetry-collector-contrib
-        ref: main
-        path: pkg/opentelemetry-collector-contrib
-
-    - name: Checkout dev opentelemetry-collector
-      if: github.event_name == 'repository_dispatch'
-      uses: actions/checkout@v2
-      with:
-        repository: ${{ github.repository_owner }}/opentelemetry-collector
-        ref: main
-        path: pkg/opentelemetry-collector
-
-    - name: append replace statement to go.mod to build with dev repo
-      if: github.event_name == 'repository_dispatch'
-      run: |
-        echo "replace github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter => ./pkg/opentelemetry-collector-contrib/exporter/awsxrayexporter" >> go.mod
-        echo "replace go.opentelemetry.io/collector => ./pkg/opentelemetry-collector" >> go.mod
-        cat go.mod
-        ls pkg
-
-    # Unit Test and attach test coverage badge
-    - name: Unit Test
-      run: make test
-
-    - name: Upload Coverage report to CodeCov
-      uses: codecov/codecov-action@v1.0.12
-      with:
-        file: ./coverage.txt
-
-    # Build and archive binaries into cache.
-    - name: Build Binaries
-      run: make build
-
-    - name: Cache binaries
-      uses: actions/cache@v2
-      with:
-        key: "cached_binaries_${{ github.run_id }}"
-        path: build
-
-    # upload the binaries to artifact as well because cache@v2 hasn't support windows
-    - name: Upload
-      uses: actions/upload-artifact@v2
-      with:
-        name: binary_artifacts
-        path: build
-
-  analyze:
-    name: CodeQL Analyze
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v1
-        with:
-          languages: "go"
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v1
-
-  packaging-msi:
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Download built artifacts
-        uses: actions/download-artifact@v2
-        with:
-          name: binary_artifacts
-          path: build
-
-      - name: Display structure of downloaded files
-        run: ls -R
-
-      - name: Create msi file using candle and light
-        run: .\tools\packaging\windows\create_msi.ps1
-
-      - name: Install AWS Cli v2
-        run: |
-          Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "AWSCLIV2.msi"
-          msiexec.exe /i AWSCLIV2.msi /passive
-          [System.Environment]::SetEnvironmentVariable('Path',$Env:Path + ";C:\\Program Files\\Amazon\\AWSCLIV2",'User')
-
-      - name: Sign windows artifacts
-        run: |
-          $pkgfile = "build\packages\windows\amd64\aws-otel-collector.msi"
-          $hashobj = Get-FileHash -Algorithm sha256 $pkgfile
-          $hash = $hashobj.Hash
-          $create_date = Get-Date -format s
-          aws s3api put-object "--body" $pkgfile "--bucket" ${{ env.WIN_UNSIGNED_PKG_BUCKET }} "--key" ${{ env.WIN_UNSIGNED_PKG_FOLDER }}/aws-otel-collector-$hash.msi
-          $objkey = ""
-          for ($num = 1 ; $num -le 60 ; $num++) { # 60 * 10 = 600s = 10min timeout
-             Start-Sleep -s 10
-             Write-Output "Poll number $num"
-             $objkey = aws s3api list-objects "--bucket" ${{ env.WIN_SIGNED_PKG_BUCKET }} "--prefix" ${{ env.WIN_SIGNED_PKG_FOLDER }}/aws-otel-collector-$hash.msi "--output" text "--query" "Contents[?LastModified>'$create_date'].Key|[0]"
-             if ($objkey -ne "None") {
-               Write-Output "Found: $objkey"
-               break
-             } else {
-               Write-Output "$objkey returned, obj not available yet, try again later"
-             }
-          }
-          if ($objkey -eq "None") {
-            Throw "Could not find the signed artifact"
-          }
-          aws s3api get-object "--bucket" ${{ env.WIN_SIGNED_PKG_BUCKET }} "--key" $objkey $pkgfile
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.SIGN_PKG_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SIGN_PKG_AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-west-2
-
-      - name: Verify package signature
-        run: |
-          $pkgfile = "build\packages\windows\amd64\aws-otel-collector.msi"
-          $sig = Get-AuthenticodeSignature $pkgfile
-          $status = $sig.Status
-          if ($status -ne "Valid") {
-            Throw "Invalid signature found: $status"
-          }
-          Write-Output "Valid signature found from the package"
-
-      - name: Upload the msi
-        uses: actions/upload-artifact@v2
-        with:
-          name: msi_artifacts
-          path: build/packages
-
-  packaging-rpm:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      # Build and archive rpms into cache.
-      - uses: actions/checkout@v2
-
-      - name: restore cached binaries
-        uses: actions/cache@v2
-        with:
-          key: "cached_binaries_${{ github.run_id }}"
-          path: build
-
-      - name: Display structure of downloaded files
-        run: ls -R
-
-      - name: Build RPM
-        run: |
-          ARCH=x86_64 DEST=build/packages/linux/amd64 tools/packaging/linux/create_rpm.sh
-          ARCH=aarch64 DEST=build/packages/linux/arm64 tools/packaging/linux/create_rpm.sh
-
-      - name: Download Package Signing GPG key
-        run: |
-          aws secretsmanager get-secret-value --region us-west-2 --secret-id "$PKG_SIGN_PRIVATE_KEY_NAME" | jq -r ".SecretString" > pkg_sign_private.key
-          md5sum pkg_sign_private.key
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.SIGN_PKG_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SIGN_PKG_AWS_SECRET_ACCESS_KEY }}
-
-      - name: Import Package Signing GPG Key
-        run: |
-          gpg --import pkg_sign_private.key
-          gpg --list-keys
-          gpg --armor --export -a "aws-otel-collector@amazon.com" > pkg_sign_public.key
-          rpm --import pkg_sign_public.key
-          echo "%_gpg_name aws-otel-collector@amazon.com" > ~/.rpmmacros
-          md5sum pkg_sign_public.key
-          shred -fuvz pkg_sign_private.key
-
-      - name: Sign RPM Pakcage
-        run: |
-          rpmsign --addsign build/packages/linux/*/*.rpm
-
-      - name: Remove Package Signing GPG Key from local GPG Key Ring
-        run: |
-          gpg --fingerprint --with-colons aws-otel-collector@amazon.com grep "^fpr" | sed -n 's/^fpr:::::::::\([[:alnum:]]\+\):/\1/p' | xargs gpg --batch --yes --delete-secret-keys
-          gpg --list-secret-keys
-
-      - name: Cache rpms
-        uses: actions/cache@v2
-        with:
-          key: "cached_rpms_${{ github.run_id }}"
-          path: build/packages
-
-  packaging-deb:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      # Build and archive debs into cache.
-      - uses: actions/checkout@v2
-
-      - name: restore cached binaries
-        uses: actions/cache@v2
-        with:
-          key: "cached_binaries_${{ github.run_id }}"
-          path: build
-
-      - name: Build Debs
-        run: |
-          ARCH=amd64 TARGET_SUPPORTED_ARCH=x86_64 DEST=build/packages/debian/amd64 tools/packaging/debian/create_deb.sh
-          ARCH=arm64 TARGET_SUPPORTED_ARCH=aarch64 DEST=build/packages/debian/arm64 tools/packaging/debian/create_deb.sh
-
-      - name: Download Package Signing GPG key
-        run: |
-          aws secretsmanager get-secret-value --region us-west-2 --secret-id "$PKG_SIGN_PRIVATE_KEY_NAME" | jq -r ".SecretString" > pkg_sign_private.key
-          md5sum pkg_sign_private.key
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.SIGN_PKG_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SIGN_PKG_AWS_SECRET_ACCESS_KEY }}
-
-      - name: Import Package Signing GPG Key
-        run: |
-          gpg --import pkg_sign_private.key
-          gpg --list-secret-keys
-          shred -fuvz pkg_sign_private.key
-
-      - name: Sign DEB Pakcage
-        run: |
-          sudo apt install -y dpkg-sig
-          dpkg-sig --sign origin -k "aws-otel-collector@amazon.com" build/packages/debian/*/*.deb
-
-      - name: Remove Package Signing GPG Key from local GPG Key Ring
-        run: |
-          gpg --fingerprint --with-colons aws-otel-collector@amazon.com grep "^fpr" | sed -n 's/^fpr:::::::::\([[:alnum:]]\+\):/\1/p' | xargs gpg --batch --yes --delete-secret-keys
-          gpg --list-secret-keys
-
-      - name: Cache Debs
-        uses: actions/cache@v2
-        with:
-          key: "cached_debs_${{ github.run_id }}"
-          path: build/packages
-
-  packaging-image:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      # Build and archive image into cache
-      - uses: actions/checkout@v2
-
-      - name: restore cached binaries
-        uses: actions/cache@v2
-        with:
-          key: "cached_binaries_${{ github.run_id }}"
-          path: build
-
-      - name: Build Image
-        run: docker build -t $IMAGE_NAME -f cmd/awscollector/Dockerfile .
-
-      - name: Extract the Image file
-        run: |
-          mkdir -p $PACKAGING_ROOT
-          docker save --output $PACKAGING_ROOT/$IMAGE_NAME.tar $IMAGE_NAME
-
-      - name: Cache Image
-        uses: actions/cache@v2
-        with:
-          key: "cached_image_${{ github.run_id }}"
-          path: "${{ env.PACKAGING_ROOT }}"
-
-  e2etest-preparation:
-    runs-on: ubuntu-latest
-    needs: [packaging-rpm, packaging-deb, packaging-msi, packaging-image]
-    outputs:
-      version: ${{ steps.versioning.outputs.version }}
-    steps:
-      # Archive all the packages into one, and build a unique version number for e2etesting
-      - uses: actions/checkout@v2
-
-      - name: Restore cached rpms
-        uses: actions/cache@v2
-        with:
-          key: "cached_rpms_${{ github.run_id }}"
-          path: build/packages
-
-      - name: Restore cached debs
-        uses: actions/cache@v2
-        with:
-          key: "cached_debs_${{ github.run_id }}"
-          path: build/packages
-
-      - name: Restore cached image
-        uses: actions/cache@v2
-        with:
-          key: "cached_image_${{ github.run_id }}"
-          path: build/packages
-
-      - name: Download built artifacts
-        uses: actions/download-artifact@v2
-        with:
-          name: msi_artifacts
-          path: build/packages
-
-      - run: ls -R
-
-      - name: Versioning for testing
-        id: versioning
-        run: |
-          # build a version with github run id so that we can distingush each build for integ-test
-          Version="`cat VERSION`-$GITHUB_RUN_ID"
-          echo $Version > build/packages/VERSION
-          cat build/packages/VERSION
-          echo "::set-output name=version::$Version"
-
-      - name: prepare CI&CD stack
-        run: |
-          cp .aoc-stack-test.yml build/packages/
-          cp .aoc-stack-release.yml build/packages/
-
-      - name: Cache the packages
-        uses: actions/cache@v2
-        with:
-          key: "cached_packages_${{ github.run_id }}"
-          path: build/packages
-
-  e2etest-release:
-    runs-on: ubuntu-latest
-    needs: [e2etest-preparation]
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.INTEG_TEST_AWS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.INTEG_TEST_AWS_KEY_SECRET }}
-          aws-region: us-west-2
-
-      - name: restore cached rpms
-        uses: actions/cache@v2
-        with:
-          path: build/packages
-          key: "cached_packages_${{ github.run_id }}"
-
-      - name: upload to s3 in the testing stack
-        run: s3_bucket_name=aws-otel-collector-test upload_to_latest=0 bash tools/release/s3-release.sh
-
-      - name: Login ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: upload to ECR
-        run: |
-          docker load < build/packages/$IMAGE_NAME.tar
-          docker tag $IMAGE_NAME ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:${{ needs.e2etest-preparation.outputs.version }}
-          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:${{ needs.e2etest-preparation.outputs.version }}
-
-          #- name: Login Dockerhub
-          #  uses: docker/login-action@v1
-          #  with:
-          #    registry: ghcr.io
-          #    username: "${{ github.repository_owner }}"
-          #    password: "${{ secrets.CONTAINER_REGISTRY_TOKEN }}"
-
-          #- name: upload to dockerhub
-          #  run: |
-          #    TAG=`cat build/packages/VERSION`
-          #    REPO_NAME="ghcr.io/${{ github.repository_owner }}/$IMAGE_NAME-test"
-          #    docker load < build/packages/$IMAGE_NAME.tar
-          #    docker tag $IMAGE_NAME $REPO_NAME:$TAG
-          #    docker push $REPO_NAME:$TAG
-
   get-testing-suites:
     runs-on: ubuntu-latest
     outputs:
@@ -438,7 +61,7 @@ jobs:
 
   e2etest-eks:
     runs-on: ubuntu-latest
-    needs: [get-testing-suites, e2etest-release, e2etest-preparation]
+    needs: [get-testing-suites]
     strategy:
       max-parallel: 5
       matrix: ${{ fromJson(needs.get-testing-suites.outputs.eks-matrix) }}
@@ -464,13 +87,13 @@ jobs:
       - name: Check out testing framework
         uses: actions/checkout@v2
         with:
-          repository: 'bjrara/aws-otel-collector-test-framework'
+          repository: 'bjrara/aws-otel-test-framework'
           path: testing-framework
 
       - name: Run testing suite on eks
         run: |
           if [[ -f testing-framework/terraform/testcases/${{ matrix.testcase }}/parameters.tfvars ]] ; then opts="-var-file=../testcases/${{ matrix.testcase }}/parameters.tfvars" ; else opts="" ; fi
-          cd testing-framework/terraform/eks && terraform init && terraform apply -auto-approve -lock=false $opts -var="aoc_version=${{ needs.e2etest-preparation.outputs.version }}" -var="testcase=../testcases/${{ matrix.testcase }}"
+          cd testing-framework/terraform/eks && terraform init && terraform apply -auto-approve -lock=false $opts -var="testcase=../testcases/${{ matrix.testcase }}"
 
       - name: Destroy resources
         if: ${{ always() }}
@@ -479,7 +102,7 @@ jobs:
 
   e2etest-containerinsight-eks-prometheus:
     runs-on: ubuntu-latest
-    needs: [ get-testing-suites, e2etest-release, e2etest-preparation ]
+    needs: [ get-testing-suites]
     strategy:
       max-parallel: 5
       matrix: ${{ fromJson(needs.get-testing-suites.outputs.containerinsight-eks-prometheus-matrix) }}
@@ -505,59 +128,16 @@ jobs:
       - name: Check out testing framework
         uses: actions/checkout@v2
         with:
-          repository: 'bjrara/aws-otel-collector-test-framework'
+          repository: 'bjrara/aws-otel-test-framework'
           path: testing-framework
 
       - name: Run testing suite on eks
         run: |
           if [[ -f testing-framework/terraform/testcases/${{ matrix.testcase }}/parameters.tfvars ]] ; then opts="-var-file=../testcases/${{ matrix.testcase }}/parameters.tfvars" ; else opts="" ; fi
-          cd testing-framework/terraform/containerinsight_eks_prometheus && terraform init && terraform apply -auto-approve -lock=false $opts -var="aoc_version=${{ needs.e2etest-preparation.outputs.version }}" -var="testcase=../testcases/${{ matrix.testcase }}"
+          cd testing-framework/terraform/containerinsight_eks_prometheus && terraform init && terraform apply -auto-approve -lock=false $opts -var="testcase=../testcases/${{ matrix.testcase }}"
 
       - name: Destroy resources
         if: ${{ always() }}
         run: |
           cd testing-framework/terraform/containerinsight_eks_prometheus && terraform destroy -auto-approve
 
-  release-candidate:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' # only create the artifact when there's a push, not for dispatch.
-    needs: [e2etest-eks]
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.INTEG_TEST_AWS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.INTEG_TEST_AWS_KEY_SECRET }}
-          aws-region: us-west-2
-
-      - name: restore cached packages
-        uses: actions/cache@v2
-        with:
-          path: build/packages
-          key: "cached_packages_${{ github.run_id }}"
-
-      - name: prepare production version
-        run: |
-          TESTING_VERSION=`cat build/packages/VERSION`
-          VERSION=`echo $TESTING_VERSION | awk -F "-" '{print $1}'`
-          echo $VERSION > build/packages/VERSION
-          echo $GITHUB_SHA > build/packages/GITHUB_SHA
-          echo $TESTING_VERSION > build/packages/TESTING_VERSION
-
-      - name: upload packages as release candidate on s3
-        run: |
-          tar czvf $GITHUB_SHA.tar.gz build
-          aws s3 cp $GITHUB_SHA.tar.gz s3://aws-otel-collector-release-candidate/$GITHUB_SHA.tar.gz
-
-      - id: file_changes
-        uses: trilom/file-changes-action@v1.2.4
-        with:
-          fileOutput: ''
-
-      - name: Trigger soaking
-        if: contains(steps.file_changes.outputs.files_modified, 'VERSION')
-        uses: peter-evans/repository-dispatch@v1.1.1
-        with:
-          token: "${{ secrets.REPO_WRITE_ACCESS_TOKEN }}"
-          event-type: bump-version
-          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
