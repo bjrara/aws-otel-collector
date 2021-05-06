@@ -11,14 +11,15 @@ RUN apk --update add ca-certificates
 RUN apk add --update bash git make build-base
 
 # config go
-COPY --from=golang:1.16.3-alpine /usr/local/go/ /usr/local/go/
+COPY --from=golang:1.15.3-alpine /usr/local/go/ /usr/local/go/
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # download go modules ahead to speed up the building
 WORKDIR /workspace
 COPY go.mod /workspace/go.mod
 COPY go.sum /workspace/go.sum
-RUN go mod download
+COPY build/linux/aoc_linux_x86_64 /workspace/build/linux/aoc_linux_x86_64
+#RUN go mod download
 
 # copy artifacts
 COPY cmd  /workspace/cmd
@@ -31,7 +32,7 @@ COPY Makefile /workspace/Makefile
 COPY config /workspace/config
 
 # build binary
-RUN make amd64-build
+#RUN make amd64-build
 
 ################################
 #	Final Stage            #	
