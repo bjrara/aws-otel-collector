@@ -39,7 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       eks-matrix: ${{ steps.set-matrix.outputs.eks-matrix }}
-      containerinsight-eks-prometheus-matrix: ${{ steps.set-matrix.outputs.containerinsight-eks-prometheus-matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -51,25 +50,24 @@ jobs:
         id: set-matrix
         run: |
           eks_matrix=$(python e2etest/get-testcases.py eks_matrix)
-          containerinsight_eks_prometheus_matrix=$(python e2etest/get-testcases.py containerinsight_eks_prometheus_matrix)
           echo "::set-output name=eks-matrix::$eks_matrix"
-          echo "::set-output name=containerinsight-eks-prometheus-matrix::$containerinsight_eks_prometheus_matrix"
       - name: List testing suites
         run: |
           echo ${{ steps.set-matrix.outputs.eks-matrix }}
-          echo ${{ steps.set-matrix.outputs.containerinsight-eks-prometheus-matrix }}
 
-  e2etest-containerinsight-eks-prometheus:
+  e2etest-eks:
     runs-on: ubuntu-latest
-    needs: [ get-testing-suites]
+    needs: [get-testing-suites]
     strategy:
+      fail-fast: false
       max-parallel: 5
-      matrix: ${{ fromJson(needs.get-testing-suites.outputs.containerinsight-eks-prometheus-matrix) }}
+      matrix: ${{ fromJson(needs.get-testing-suites.outputs.eks-matrix) }}
 
     steps:
       - uses: actions/checkout@v2
 
       - name: Configure AWS Credentials
+        if: steps.e2etest-eks.outputs.cache-hit != 'true'
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.INTEG_TEST_AWS_KEY_ID }}
@@ -77,26 +75,29 @@ jobs:
           aws-region: us-west-2
 
       - name: Set up JDK 1.11
+        if: steps.e2etest-eks.outputs.cache-hit != 'true'
         uses: actions/setup-java@v1
         with:
           java-version: 1.11
 
       - name: Set up terraform
+        if: steps.e2etest-eks.outputs.cache-hit != 'true'
         uses: hashicorp/setup-terraform@v1
 
       - name: Check out testing framework
+        if: steps.e2etest-eks.outputs.cache-hit != 'true'
         uses: actions/checkout@v2
         with:
           repository: 'bjrara/aws-otel-test-framework'
           path: testing-framework
 
       - name: Run testing suite on eks
+        if: steps.e2etest-eks.outputs.cache-hit != 'true'
         run: |
           if [[ -f testing-framework/terraform/testcases/${{ matrix.testcase }}/parameters.tfvars ]] ; then opts="-var-file=../testcases/${{ matrix.testcase }}/parameters.tfvars" ; else opts="" ; fi
-          cd testing-framework/terraform/containerinsight_eks_prometheus && terraform init && terraform apply -auto-approve -lock=false $opts -var="testcase=../testcases/${{ matrix.testcase }}"
+          cd testing-framework/terraform/eks && terraform init && terraform apply -auto-approve -lock=false $opts -var="testcase=../testcases/${{ matrix.testcase }}"
 
       - name: Destroy resources
-        if: ${{ always() }}
+        if: ${{ always() && steps.e2etest-eks.outputs.cache-hit != 'true' }}
         run: |
-          cd testing-framework/terraform/containerinsight_eks_prometheus && terraform destroy -var="testcase=../testcases/${{ matrix.testcase }}" -auto-approve
-
+          cd testing-framework/terraform/eks && terraform destroy -auto-approve
